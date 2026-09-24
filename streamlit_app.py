@@ -4,6 +4,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 import unicodedata
 import xml.etree.ElementTree as ET
+from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 from io import BytesIO
 from zoneinfo import ZoneInfo
@@ -63,6 +64,35 @@ def parse_date(value):
     if dt.tzinfo is not None:
         dt = dt.astimezone(LOCAL_TZ).replace(tzinfo=None)
     return dt
+
+
+CIERRE_RE = re.compile(
+    r"Recepci[óo]n de ofertas hasta:?\s*(\d{1,2}/\d{1,2}/\d{4})(?:\s+(\d{1,2}:\d{2}))?", re.IGNORECASE
+)
+META_RE = re.compile(r"\s*(Recepci[óo]n de ofertas hasta|Publicado):.*$", re.IGNORECASE)
+
+
+def parse_cierre(desc):
+    """Saca la fecha de 'Recepción de ofertas hasta: 17/03/2027 11:00hs' de la descripción."""
+    m = CIERRE_RE.search(desc or "")
+    if not m:
+        return pd.NaT
+    return pd.to_datetime(f"{m.group(1)} {m.group(2) or '23:59'}", format="%d/%m/%Y %H:%M", errors="coerce")
+
+
+def countdown(cierre, now):
+    """Texto tipo '🔴 Faltan 3 días' según lo que falta para el cierre de ofertas."""
+    if pd.isna(cierre):
+        return "Sin fecha"
+    if cierre < now:
+        return "⚫ Cerrado"
+    days = (cierre.date() - now.date()).days
+    if days == 0:
+        return f"🔴 Hoy {cierre:%H:%M}"
+    if days == 1:
+        return f"🔴 Mañana {cierre:%H:%M}"
+    color = "🔴" if days <= 3 else "🟡" if days <= 7 else "🟢"
+    return f"{color} Faltan {days} días"
 
 
 def split_terms(raw):
@@ -173,6 +203,10 @@ except ET.ParseError as e:
 
 df_all = pd.DataFrame(items, columns=COLUMNS)
 df_all["Fecha publicación"] = pd.to_datetime(df_all["Fecha publicación"], errors="coerce")
+df_all["Cierre de ofertas"] = pd.to_datetime(df_all["Descripción"].map(parse_cierre), errors="coerce")
+df_all["Descripción"] = df_all["Descripción"].map(lambda d: META_RE.sub("", d or ""))
+NOW = datetime.now(LOCAL_TZ).replace(tzinfo=None)
+df_all["Faltan"] = df_all["Cierre de ofertas"].map(lambda c: countdown(c, NOW))
 
 # --- Filtros ---
 c1, c2 = st.columns(2)
@@ -198,6 +232,9 @@ match_all = c4.checkbox(
     value=False,
     help="Si está desmarcado, alcanza con que aparezca una.",
 )
+c6, c7, _ = st.columns([1, 1, 1])
+hide_closed = c6.checkbox("Ocultar llamados con el plazo vencido", value=True)
+sort_by = c7.selectbox("Ordenar por", ["Cierre más próximo", "Publicación más reciente"])
 whole_words = c5.checkbox(
     "Solo palabras completas (incluye plurales)",
     value=True,
@@ -254,11 +291,24 @@ def where_matched(i):
 
 
 df_all["Coincide en"] = [where_matched(i) for i in df_all.index] if include else ""
-df = df_all[mask].sort_values("Fecha publicación", ascending=False, na_position="last")
-SHOW = ["Título", "Descripción", "Ítems", "Coincide en", "Fecha publicación", "Enlace"]
-EXPORT = ["Título", "Descripción", "Ítems", "Coincide en", "Fecha publicación", "Enlace"]
+if hide_closed:
+    mask &= ~(df_all["Cierre de ofertas"] < NOW)
+if sort_by == "Cierre más próximo":
+    df = df_all[mask].sort_values("Cierre de ofertas", ascending=True, na_position="last")
+else:
+    df = df_all[mask].sort_values("Fecha publicación", ascending=False, na_position="last")
+SHOW = ["Faltan", "Título", "Descripción", "Ítems", "Coincide en",
+        "Cierre de ofertas", "Fecha publicación", "Enlace"]
+EXPORT = SHOW
 
 # --- Resultados ---
+days_left = (df["Cierre de ofertas"].dt.normalize() - pd.Timestamp(NOW.date())).dt.days
+open_mask = df["Cierre de ofertas"] >= NOW
+m1, m2, m3 = st.columns(3)
+m1.metric("🔴 Cierran en 3 días o menos", int((open_mask & (days_left <= 3)).sum()))
+m2.metric("🟡 Cierran en 4 a 7 días", int((open_mask & days_left.between(4, 7)).sum()))
+m3.metric("Llamados en la lista", len(df))
+
 st.write(f"Se encontraron **{len(df)}** de {len(df_all)} llamados después del filtrado.")
 
 if df.empty:
@@ -273,6 +323,10 @@ else:
             "Fecha publicación": st.column_config.DatetimeColumn(
                 "Fecha publicación", format="DD/MM/YYYY HH:mm"
             ),
+            "Cierre de ofertas": st.column_config.DatetimeColumn(
+                "Cierre de ofertas", format="DD/MM/YYYY HH:mm"
+            ),
+            "Faltan": st.column_config.TextColumn("Faltan", width="small"),
             "Descripción": st.column_config.TextColumn("Descripción", width="large"),
             "Ítems": st.column_config.TextColumn("Ítems", width="large"),
             "Coincide en": st.column_config.TextColumn("Coincide en", width="medium"),
@@ -296,16 +350,50 @@ def to_excel_bytes(frame):
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
         frame.to_excel(writer, index=False, sheet_name="Llamados")
         ws = writer.sheets["Llamados"]
-        widths = {"A": 60, "B": 70, "C": 80, "D": 22, "E": 18, "F": 55}
-        for col, width in widths.items():
-            ws.column_dimensions[col].width = width
-        for cell in ws["E"][1:]:
-            cell.number_format = "DD/MM/YYYY HH:MM"
+        widths = {"Faltan": 20, "Título": 60, "Descripción": 70, "Ítems": 80,
+                  "Coincide en": 30, "Cierre de ofertas": 18, "Fecha publicación": 18, "Enlace": 55}
+        for idx, name in enumerate(frame.columns, start=1):
+            letter = ws.cell(row=1, column=idx).column_letter
+            ws.column_dimensions[letter].width = widths.get(name, 20)
+            if name in ("Cierre de ofertas", "Fecha publicación"):
+                for cell in ws[letter][1:]:
+                    cell.number_format = "DD/MM/YYYY HH:MM"
         ws.freeze_panes = "A2"
     return output.getvalue()
 
 
-d1, d2, _ = st.columns([1, 1, 4])
+def ics_escape(text):
+    return (text or "").replace("\\", "\\\\").replace(";", "\\;").replace(",", "\\,").replace("\n", "\\n")
+
+
+def to_ics_bytes(frame):
+    """Calendario con el cierre de cada llamado y avisos 3 días y 1 día antes."""
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    lines = ["BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//Essen//Llamados ARCE//ES", "CALSCALE:GREGORIAN"]
+    for _, row in frame.dropna(subset=["Cierre de ofertas"]).iterrows():
+        start = row["Cierre de ofertas"].to_pydatetime().replace(tzinfo=LOCAL_TZ).astimezone(timezone.utc)
+        end = start + timedelta(minutes=30)
+        uid = re.sub(r"\W", "", row["Enlace"] or row["Título"])[-60:]
+        lines += [
+            "BEGIN:VEVENT",
+            f"UID:{uid}@llamados-essen",
+            f"DTSTAMP:{stamp}",
+            f"DTSTART:{start:%Y%m%dT%H%M%SZ}",
+            f"DTEND:{end:%Y%m%dT%H%M%SZ}",
+            f"SUMMARY:{ics_escape('Cierre de ofertas: ' + row['Título'])}",
+            f"DESCRIPTION:{ics_escape(row['Descripción'] + chr(10) + chr(10) + row['Enlace'])}",
+            f"URL:{row['Enlace']}",
+        ]
+        for trigger, label in (("-P3D", "Faltan 3 días"), ("-P1D", "Falta 1 día")):
+            lines += ["BEGIN:VALARM", "ACTION:DISPLAY", f"TRIGGER:{trigger}",
+                      f"DESCRIPTION:{ics_escape(label + ' para el cierre: ' + row['Título'])}", "END:VALARM"]
+        lines.append("END:VEVENT")
+    lines.append("END:VCALENDAR")
+    return "\r\n".join(lines).encode("utf-8")
+
+
+has_dates = df["Cierre de ofertas"].notna().any()
+d1, d2, d3, _ = st.columns([1, 1, 2, 2])
 d1.download_button(
     "Descargar CSV",
     to_csv_bytes(df[EXPORT]),
@@ -319,4 +407,13 @@ d2.download_button(
     file_name="llamados_filtrados.xlsx",
     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     disabled=df.empty,
+)
+d3.download_button(
+    "📅 Agregar cierres al calendario (.ics)",
+    to_ics_bytes(df),
+    file_name="cierres_llamados.ics",
+    mime="text/calendar",
+    disabled=not has_dates,
+    help="Crea un evento por llamado en la fecha de cierre, con avisos 3 días y 1 día antes. "
+         "Se importa en Google Calendar u Outlook.",
 )
