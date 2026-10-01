@@ -1,5 +1,6 @@
 import html
 import re
+import threading
 import time
 import unicodedata
 import xml.etree.ElementTree as ET
@@ -20,8 +21,9 @@ st.set_page_config(page_title="Llamados Compras Estatales", page_icon="📋", la
 # ============================================================
 LOCAL_TZ = ZoneInfo("America/Montevideo")
 FEED_URL = "https://www.comprasestatales.gub.uy/consultas/rss"
-DETAIL_TTL = 6 * 60 * 60  # segundos que se guarda el detalle de cada llamado
-DETAIL_WORKERS = 8
+DETAIL_TTL = 24 * 60 * 60  # el detalle de un llamado casi no cambia: se guarda 24 h
+DETAIL_RETRY = 5 * 60  # si una página falla, se reintenta a los 5 minutos
+DETAIL_WORKERS = 16
 PAGE_SIZE = 20  # tarjetas que se muestran antes de "Mostrar más"
 
 # Palabras clave de los rubros de Essen. Editá esta lista para cambiar lo que aparece por defecto.
@@ -198,9 +200,26 @@ BOILERPLATE_RE = re.compile(
 
 
 @st.cache_resource
-def detail_store():
-    """Guarda el detalle ya descargado entre recargas y usuarios: {url: (timestamp, datos)}."""
-    return {}
+def detail_loader():
+    """Estado compartido entre recargas y usuarios: lo ya leído, lo que se está leyendo y el pool."""
+    return {
+        "store": {},        # url -> (timestamp, datos)
+        "failed": {},       # url -> timestamp del último fallo
+        "inflight": set(),  # urls que se están descargando ahora
+        "lock": threading.Lock(),
+        "pool": ThreadPoolExecutor(max_workers=DETAIL_WORKERS),
+    }
+
+
+_tls = threading.local()
+
+
+def http():
+    """Una sesión HTTP por hilo: reutiliza la conexión con ARCE y es bastante más rápido."""
+    if not hasattr(_tls, "session"):
+        _tls.session = requests.Session()
+        _tls.session.headers.update(HEADERS)
+    return _tls.session
 
 
 def parse_detail(page_html, titulo):
@@ -209,44 +228,57 @@ def parse_detail(page_html, titulo):
     m = re.search(r"\d+/\d{4}", titulo or "")
     if m and m.group(0) in text:
         text = text[text.index(m.group(0)):]
-    items = [f"{num} · {desc.strip()} (cód. {cod})" for num, desc, cod in ITEM_RE.findall(text)]
-    return {"Ítems": " | ".join(items), "Detalle": text}
+    items = " | ".join(f"{num} · {desc.strip()} (cód. {cod})" for num, desc, cod in ITEM_RE.findall(text))
+    # Se guarda también la versión normalizada para no recalcularla en cada recarga
+    return {"Ítems": items, "Detalle": text, "_items_n": normalize(items), "_detalle_n": normalize(text)}
 
 
 def fetch_detail(url, titulo):
     try:
-        resp = requests.get(url, headers=HEADERS, timeout=15)
+        resp = http().get(url, timeout=15)
         resp.raise_for_status()
         resp.encoding = resp.encoding or resp.apparent_encoding
         return parse_detail(resp.text, titulo)
     except Exception:
-        return None  # si falla, se reintenta en la próxima carga
+        return None
 
 
-def load_details(frame):
-    """Descarga en paralelo el detalle de los llamados que no estén en caché."""
-    store = detail_store()
+def _detail_job(loader, url, titulo):
+    data = fetch_detail(url, titulo)
+    with loader["lock"]:
+        if data is not None:
+            loader["store"][url] = (time.time(), data)
+            loader["failed"].pop(url, None)
+        else:
+            loader["failed"][url] = time.time()
+        loader["inflight"].discard(url)
+
+
+def request_details(urls, titles):
+    """Encola en segundo plano los llamados sin detalle (o vencido). No bloquea la página."""
+    loader = detail_loader()
     now = time.time()
-    pending = [
-        (url, tit) for url, tit in zip(frame["Enlace"], frame["Título"])
-        if url and (url not in store or now - store[url][0] > DETAIL_TTL)
-    ]
-    if pending:
-        bar = st.progress(0.0, text=f"Leyendo el detalle de {len(pending)} llamados...")
-        with ThreadPoolExecutor(max_workers=DETAIL_WORKERS) as pool:
-            results = pool.map(lambda a: fetch_detail(*a), pending)
-            for i, ((url, _), data) in enumerate(zip(pending, results), start=1):
-                if data is not None:
-                    store[url] = (now, data)
-                bar.progress(i / len(pending), text=f"Leyendo el detalle de llamados... {i}/{len(pending)}")
-        bar.empty()
-    failed = sum(1 for url in frame["Enlace"] if url and url not in store)
-    get = lambda url, key: store[url][1][key] if url in store else ""
-    return (
-        frame["Enlace"].map(lambda u: get(u, "Ítems")),
-        frame["Enlace"].map(lambda u: get(u, "Detalle")),
-        failed,
-    )
+    with loader["lock"]:
+        for url, titulo in zip(urls, titles):
+            if not url or url in loader["inflight"]:
+                continue
+            cached = loader["store"].get(url)
+            if cached and now - cached[0] < DETAIL_TTL:
+                continue
+            if now - loader["failed"].get(url, 0) < DETAIL_RETRY:
+                continue
+            loader["inflight"].add(url)
+            loader["pool"].submit(_detail_job, loader, url, titulo)
+
+
+def detail_snapshot(urls):
+    """Lo que ya se leyó, más cuántos están pendientes y cuántos fallaron."""
+    loader = detail_loader()
+    with loader["lock"]:
+        got = {u: loader["store"][u][1] for u in urls if u in loader["store"]}
+        pending = sum(1 for u in urls if u in loader["inflight"])
+        failed = sum(1 for u in urls if u in loader["failed"] and u not in got)
+    return got, pending, failed
 
 
 # ============================================================
@@ -282,7 +314,9 @@ with st.sidebar:
     st.divider()
     if st.button("Actualizar datos", width="stretch"):
         fetch_feed.clear()
-        detail_store().clear()
+        with detail_loader()["lock"]:
+            detail_loader()["store"].clear()
+            detail_loader()["failed"].clear()
 
 # ============================================================
 # Datos
@@ -312,9 +346,17 @@ df_all["Faltan"] = df_all["Cierre de ofertas"].map(lambda c: countdown(c, NOW)[0
 
 df_all["Ítems"] = ""
 df_all["Detalle"] = ""
-failed = 0
+failed = pending = 0
+details = {}
 if search_detail:
-    df_all["Ítems"], df_all["Detalle"], failed = load_details(df_all)
+    # Solo se leen los llamados abiertos (salvo que se quieran ver también los vencidos),
+    # y primero los que cierran antes.
+    targets = df_all if not hide_closed else df_all[~(df_all["Cierre de ofertas"] < NOW)]
+    targets = targets.sort_values("Cierre de ofertas", na_position="last")
+    request_details(targets["Enlace"].tolist(), targets["Título"].tolist())
+    details, pending, failed = detail_snapshot(targets["Enlace"].tolist())
+    n_targets = len(targets)
+    df_all["Ítems"] = df_all["Enlace"].map(lambda u: details[u]["Ítems"] if u in details else "")
 
 # ============================================================
 # Filtrado
@@ -334,7 +376,12 @@ include_pats = {t: term_pattern(t) for t in include}
 exclude_pats = [term_pattern(t) for t in exclude]
 
 FIELDS = ["Título", "Descripción", "Ítems", "Detalle"]
-norm_fields = {f: df_all[f].fillna("").map(normalize) for f in FIELDS}
+norm_fields = {
+    "Título": df_all["Título"].map(normalize),
+    "Descripción": df_all["Descripción"].map(normalize),
+    "Ítems": df_all["Enlace"].map(lambda u: details[u]["_items_n"] if u in details else ""),
+    "Detalle": df_all["Enlace"].map(lambda u: details[u]["_detalle_n"] if u in details else ""),
+}
 haystack = pd.concat(norm_fields.values(), axis=1).agg(" ".join, axis=1) if len(df_all) else pd.Series(dtype=str)
 
 mask = pd.Series(True, index=df_all.index)
@@ -391,10 +438,17 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-if failed:
+if search_detail and pending:
+    done = n_targets - pending
+    st.progress(
+        done / max(n_targets, 1),
+        text=f"Buscando dentro de los llamados: {done} de {n_targets} leídos. "
+             "Ya podés usar la app; los resultados se completan solos.",
+    )
+elif failed:
     st.caption(
         f"⚠️ No se pudo leer el detalle de {failed} llamados; en esos solo se buscó en título "
-        "y descripción. Tocá «Actualizar datos» para reintentar."
+        "y descripción. Se reintentan solos en unos minutos."
     )
 
 # ============================================================
@@ -568,3 +622,8 @@ with st.sidebar:
         "Fuente: RSS de ARCE. Se buscan el título, la descripción y la página de cada llamado, "
         "no los pliegos adjuntos."
     )
+
+# Mientras se leen llamados en segundo plano, la página se refresca sola cada pocos segundos
+if search_detail and pending:
+    time.sleep(3)
+    st.rerun()
