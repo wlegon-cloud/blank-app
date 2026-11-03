@@ -4,8 +4,6 @@ import threading
 import time
 import unicodedata
 import xml.etree.ElementTree as ET
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
@@ -15,6 +13,8 @@ from zoneinfo import ZoneInfo
 import pandas as pd
 import requests
 import streamlit as st
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 st.set_page_config(page_title="Llamados Compras Estatales", page_icon="📋", layout="wide")
 
@@ -23,10 +23,12 @@ st.set_page_config(page_title="Llamados Compras Estatales", page_icon="📋", la
 # ============================================================
 LOCAL_TZ = ZoneInfo("America/Montevideo")
 FEED_URL = "https://www.comprasestatales.gub.uy/consultas/rss"
-DETAIL_TTL = 24 * 60 * 60  # el detalle de un llamado casi no cambia: se guarda 24 h
-DETAIL_RETRY = 5 * 60  # si una página falla, se reintenta a los 5 minutos
+DETAIL_TTL = 24 * 60 * 60   # el detalle de un llamado casi no cambia: se guarda 24 h
+DETAIL_RETRY = 5 * 60       # si una página falla, se reintenta a los 5 minutos
 DETAIL_WORKERS = 16
-PAGE_SIZE = 20  # tarjetas que se muestran antes de "Mostrar más"
+PAGE_SIZE = 20              # tarjetas que se muestran antes de "Mostrar más"
+FEED_TIMEOUT = (10, 90)     # (conexión, lectura) en segundos
+FEED_RETRIES = 3
 
 # Palabras clave de los rubros de Essen. Editá esta lista para cambiar lo que aparece por defecto.
 DEFAULT_INCLUDE = [
@@ -34,6 +36,7 @@ DEFAULT_INCLUDE = [
     "puerta cortafuego", "cortafuego", "ignifuga", "antipanico",
     "contenedor", "papelera", "estante", "estanteria", "rack",
 ]
+
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                   "(KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36"
@@ -44,44 +47,41 @@ HEADERS = {
 # ============================================================
 st.markdown(
     """
-<style>
-.block-container {padding-top: 2rem; padding-bottom: 3rem; max-width: 1200px;}
-h1.app-title {font-size: 1.75rem; font-weight: 700; margin: 0; color: #0f172a;}
-p.app-sub {color: #64748b; margin: .25rem 0 1.5rem 0; font-size: .95rem;}
-
-.stats {display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; margin-bottom: 1.5rem;}
-.stat {background: #fff; border: 1px solid #e2e8f0; border-radius: 12px; padding: 14px 18px;}
-.stat .n {font-size: 1.75rem; font-weight: 700; line-height: 1.1; color: #0f172a;}
-.stat .l {font-size: .85rem; color: #64748b; margin-top: 2px;}
-.stat.red .n {color: #dc2626;}
-.stat.amber .n {color: #d97706;}
-
-.results-head {color: #475569; font-size: .95rem; margin: .25rem 0 .75rem 0;}
-
-.card {background: #fff; border: 1px solid #e2e8f0; border-radius: 12px;
-       padding: 16px 20px; margin-bottom: 12px;}
-.card:hover {border-color: #cbd5e1; box-shadow: 0 1px 3px rgba(15,23,42,.06);}
-.card-top {display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 6px;}
-.badge {font-size: .78rem; font-weight: 600; padding: 3px 10px; border-radius: 999px; white-space: nowrap;}
-.badge.red {background: #fee2e2; color: #b91c1c;}
-.badge.amber {background: #fef3c7; color: #92400e;}
-.badge.green {background: #dcfce7; color: #166534;}
-.badge.gray {background: #f1f5f9; color: #475569;}
-.ref {font-size: .82rem; color: #64748b;}
-.org {font-size: 1.02rem; font-weight: 600; color: #0f172a; margin-bottom: 4px;}
-.desc {font-size: .93rem; color: #334155; margin-bottom: 10px;}
-.chips {display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 10px;}
-.chip {font-size: .8rem; padding: 3px 9px; border-radius: 6px; background: #f1f5f9; color: #475569;}
-.chip.hit {background: #e0e7ff; color: #3730a3; font-weight: 500;}
-.chip.more {background: transparent; color: #94a3b8; padding-left: 2px;}
-.card-foot {display: flex; justify-content: space-between; align-items: center; gap: 12px;
-            flex-wrap: wrap; border-top: 1px solid #f1f5f9; padding-top: 10px; font-size: .82rem; color: #64748b;}
-.card-foot .terms b {color: #3730a3; font-weight: 600;}
-.card-foot .weak {color: #94a3b8; font-style: italic;}
-.card-foot a {color: #2563eb; font-weight: 600; text-decoration: none; white-space: nowrap;}
-.card-foot a:hover {text-decoration: underline;}
-</style>
-""",
+    <style>
+    .block-container {padding-top: 2rem; padding-bottom: 3rem; max-width: 1200px;}
+    h1.app-title {font-size: 1.75rem; font-weight: 700; margin: 0; color: #0f172a;}
+    p.app-sub {color: #64748b; margin: .25rem 0 1.5rem 0; font-size: .95rem;}
+    .stats {display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; margin-bottom: 1.5rem;}
+    .stat {background: #fff; border: 1px solid #e2e8f0; border-radius: 12px; padding: 14px 18px;}
+    .stat .n {font-size: 1.75rem; font-weight: 700; line-height: 1.1; color: #0f172a;}
+    .stat .l {font-size: .85rem; color: #64748b; margin-top: 2px;}
+    .stat.red .n {color: #dc2626;}
+    .stat.amber .n {color: #d97706;}
+    .results-head {color: #475569; font-size: .95rem; margin: .25rem 0 .75rem 0;}
+    .card {background: #fff; border: 1px solid #e2e8f0; border-radius: 12px;
+           padding: 16px 20px; margin-bottom: 12px;}
+    .card:hover {border-color: #cbd5e1; box-shadow: 0 1px 3px rgba(15,23,42,.06);}
+    .card-top {display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 6px;}
+    .badge {font-size: .78rem; font-weight: 600; padding: 3px 10px; border-radius: 999px; white-space: nowrap;}
+    .badge.red {background: #fee2e2; color: #b91c1c;}
+    .badge.amber {background: #fef3c7; color: #92400e;}
+    .badge.green {background: #dcfce7; color: #166534;}
+    .badge.gray {background: #f1f5f9; color: #475569;}
+    .ref {font-size: .82rem; color: #64748b;}
+    .org {font-size: 1.02rem; font-weight: 600; color: #0f172a; margin-bottom: 4px;}
+    .desc {font-size: .93rem; color: #334155; margin-bottom: 10px;}
+    .chips {display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 10px;}
+    .chip {font-size: .8rem; padding: 3px 9px; border-radius: 6px; background: #f1f5f9; color: #475569;}
+    .chip.hit {background: #e0e7ff; color: #3730a3; font-weight: 500;}
+    .chip.more {background: transparent; color: #94a3b8; padding-left: 2px;}
+    .card-foot {display: flex; justify-content: space-between; align-items: center; gap: 12px;
+                flex-wrap: wrap; border-top: 1px solid #f1f5f9; padding-top: 10px; font-size: .82rem; color: #64748b;}
+    .card-foot .terms b {color: #3730a3; font-weight: 600;}
+    .card-foot .weak {color: #94a3b8; font-style: italic;}
+    .card-foot a {color: #2563eb; font-weight: 600; text-decoration: none; white-space: nowrap;}
+    .card-foot a:hover {text-decoration: underline;}
+    </style>
+    """,
     unsafe_allow_html=True,
 )
 
@@ -121,8 +121,8 @@ def parse_date(value):
         dt = parsedate_to_datetime(value)
     except (TypeError, ValueError):
         dt = pd.to_datetime(value, errors="coerce")
-        if pd.isna(dt):
-            return pd.NaT
+    if pd.isna(dt):
+        return pd.NaT
     if dt.tzinfo is not None:
         dt = dt.astimezone(LOCAL_TZ).replace(tzinfo=None)
     return dt
@@ -171,11 +171,33 @@ def split_terms(raw):
 # ============================================================
 # Descarga del feed y del detalle de cada llamado
 # ============================================================
-@st.cache_data(ttl=300, show_spinner="Descargando llamados...")
-def fetch_feed(url):
-    resp = requests.get(url, headers=HEADERS, timeout=20)
+@st.cache_resource
+def feed_state():
+    """Guarda el último feed descargado con éxito, para usarlo si el sitio falla."""
+    return {"last": None}
+
+
+def download_feed(url):
+    """Descarga el feed con timeouts separados y reintentos con espera creciente."""
+    session = requests.Session()
+    session.headers.update(HEADERS)
+    retry = Retry(
+        total=FEED_RETRIES,
+        backoff_factor=2,
+        status_forcelist=(500, 502, 503, 504),
+        allowed_methods=("GET",),
+    )
+    session.mount("https://", HTTPAdapter(max_retries=retry))
+    resp = session.get(url, timeout=FEED_TIMEOUT)
     resp.raise_for_status()
     return resp.content, datetime.now(LOCAL_TZ)  # bytes: respeta el encoding declarado en el XML
+
+
+@st.cache_data(ttl=300, show_spinner="Descargando llamados...")
+def fetch_feed(url):
+    result = download_feed(url)
+    feed_state()["last"] = result  # respaldo por si la próxima descarga falla
+    return result
 
 
 def parse_rss(xml_bytes):
@@ -323,20 +345,31 @@ with st.sidebar:
 # ============================================================
 # Datos
 # ============================================================
+stale_warning = None
 try:
-    feed_bytes, fetched_at = fetch_feed(FEED_URL)
+    try:
+        feed_bytes, fetched_at = fetch_feed(FEED_URL)
+    except requests.exceptions.RequestException as e:
+        last = feed_state()["last"]
+        if last is None:
+            if isinstance(e, requests.exceptions.Timeout):
+                st.error("El sitio de Compras Estatales no respondió a tiempo. Probá de nuevo en unos minutos.")
+            else:
+                st.error(f"No se pudo acceder al feed: {e}")
+            st.stop()
+        # Hay un feed anterior: se usa y se avisa
+        feed_bytes, fetched_at = last
+        stale_warning = (
+            f"El sitio de Compras Estatales no respondió; se muestran los datos de las "
+            f"{fetched_at:%d/%m %H:%M}. Probá «Actualizar datos» en unos minutos."
+        )
     items = parse_rss(feed_bytes)
-except requests.exceptions.Timeout:
-    st.error("El sitio de Compras Estatales no respondió a tiempo. Probá de nuevo en unos minutos.")
-    st.stop()
-except requests.exceptions.RequestException as e:
-    st.error(f"No se pudo acceder al feed: {e}")
-    st.stop()
 except ET.ParseError as e:
     st.error(f"El feed no es un XML válido: {e}")
     st.stop()
 
 NOW = datetime.now(LOCAL_TZ).replace(tzinfo=None)
+
 df_all = pd.DataFrame(items, columns=["Título", "Descripción", "Fecha publicación", "Enlace"])
 df_all["Fecha publicación"] = pd.to_datetime(df_all["Fecha publicación"], errors="coerce")
 df_all["Cierre de ofertas"] = pd.to_datetime(df_all["Descripción"].map(parse_cierre), errors="coerce")
@@ -345,9 +378,9 @@ df_all[["Llamado", "Organismo"]] = pd.DataFrame(
     df_all["Título"].map(split_title).tolist(), index=df_all.index
 ) if len(df_all) else pd.DataFrame(columns=["Llamado", "Organismo"])
 df_all["Faltan"] = df_all["Cierre de ofertas"].map(lambda c: countdown(c, NOW)[0])
-
 df_all["Ítems"] = ""
 df_all["Detalle"] = ""
+
 failed = pending = 0
 details = {}
 if search_detail:
@@ -424,19 +457,22 @@ st.markdown(
     f'actualizado {fetched_at:%d/%m %H:%M}</p>',
     unsafe_allow_html=True,
 )
+if stale_warning:
+    st.warning(stale_warning)
 
 days_left = (df["Cierre de ofertas"].dt.normalize() - pd.Timestamp(NOW.date())).dt.days
 open_mask = df["Cierre de ofertas"] >= NOW
 n_red = int((open_mask & (days_left <= 3)).sum())
 n_amber = int((open_mask & days_left.between(4, 7)).sum())
+
 st.markdown(
     f"""
-<div class="stats">
-  <div class="stat red"><div class="n">{n_red}</div><div class="l">Cierran en 3 días o menos</div></div>
-  <div class="stat amber"><div class="n">{n_amber}</div><div class="l">Cierran en 4 a 7 días</div></div>
-  <div class="stat"><div class="n">{len(df)}</div><div class="l">Llamados que coinciden</div></div>
-</div>
-""",
+    <div class="stats">
+      <div class="stat red"><div class="n">{n_red}</div><div class="l">Cierran en 3 días o menos</div></div>
+      <div class="stat amber"><div class="n">{n_amber}</div><div class="l">Cierran en 4 a 7 días</div></div>
+      <div class="stat"><div class="n">{len(df)}</div><div class="l">Llamados que coinciden</div></div>
+    </div>
+    """,
     unsafe_allow_html=True,
 )
 
@@ -492,6 +528,7 @@ def render_card(i, row):
             terms_html += ' <span class="weak">· solo en el texto del llamado</span>'
     else:
         terms_html = ""
+
     dates = []
     if pd.notna(row["Cierre de ofertas"]):
         dates.append(f"Cierre {row['Cierre de ofertas']:%d/%m/%Y %H:%M}")
@@ -499,19 +536,19 @@ def render_card(i, row):
         dates.append(f"Publicado {row['Fecha publicación']:%d/%m}")
 
     return f"""
-<div class="card">
-  <div class="card-top">
-    <span class="badge {level}">{esc(label)}</span>
-    <span class="ref">{esc(row["Llamado"])}</span>
-  </div>
-  <div class="org">{esc(row["Organismo"])}</div>
-  <div class="desc">{esc(tidy_case(row["Descripción"]))}</div>
-  {f'<div class="chips">{chips}</div>' if chips else ''}
-  <div class="card-foot">
-    <span class="terms">{terms_html}</span>
-    <span>{" · ".join(dates)} &nbsp; <a href="{esc(row["Enlace"])}" target="_blank">Ver llamado →</a></span>
-  </div>
-</div>"""
+    <div class="card">
+      <div class="card-top">
+        <span class="badge {level}">{esc(label)}</span>
+        <span class="ref">{esc(row["Llamado"])}</span>
+      </div>
+      <div class="org">{esc(row["Organismo"])}</div>
+      <div class="desc">{esc(tidy_case(row["Descripción"]))}</div>
+      {f'<div class="chips">{chips}</div>' if chips else ''}
+      <div class="card-foot">
+        <span class="terms">{terms_html}</span>
+        <span>{" · ".join(dates)} &nbsp; <a href="{esc(row["Enlace"])}" target="_blank">Ver llamado →</a></span>
+      </div>
+    </div>"""
 
 
 if df.empty:
@@ -523,6 +560,7 @@ elif view == "Tarjetas":
         st.session_state.signature = signature
         st.session_state.limit = PAGE_SIZE
     limit = st.session_state.limit
+
     st.markdown(
         "".join(render_card(i, row) for i, row in df.head(limit).iterrows()),
         unsafe_allow_html=True,
@@ -542,7 +580,6 @@ else:
             "Descripción": st.column_config.TextColumn("Descripción", width="large"),
         },
     )
-
 
 # ============================================================
 # Descargas (en la barra lateral)
@@ -624,6 +661,11 @@ with st.sidebar:
         "Fuente: RSS de ARCE. Se buscan el título, la descripción y la página de cada llamado, "
         "no los pliegos adjuntos."
     )
+
+# Mientras se leen llamados en segundo plano, la página se refresca sola cada pocos segundos
+if search_detail and pending:
+    time.sleep(3)
+    st.rerun()
 
 # Mientras se leen llamados en segundo plano, la página se refresca sola cada pocos segundos
 if search_detail and pending:
